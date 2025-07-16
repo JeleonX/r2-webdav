@@ -4,7 +4,7 @@
 
 Use Cloudflare Workers to provide a WebDav interface for Cloudflare R2.
 
-## Usage
+## 新建worker，连接到git，r2存储桶名称须为webdav，新建变量用户名USERNAME，密码PASSWORD ✔
 
 Change wrangler.toml to your own.
 

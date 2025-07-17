@@ -703,7 +703,7 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 	switch (request.method) {
 		case 'OPTIONS': {
 			return new Response(null, {
-				status: 200,
+				status: 204,
 				headers: {
 					Allow: SUPPORT_METHODS.join(', '),
 					DAV: DAV_CLASS,
@@ -761,37 +761,53 @@ function is_authorized(authorization_header: string, username: string, password:
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
+		let response: Response;
 
-		if (
-			request.method !== 'OPTIONS' &&
-			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
-		) {
-			return new Response('Unauthorized', {
+		// --- 修改 2 开始 ---
+		// 1. 对所有请求（包括 OPTIONS）强制执行身份验证。
+		// 2. 如果验证失败，返回一个包含 'WWW-Authenticate' 和 'DAV' 头的 401 响应。
+		//    在 401 响应中包含 'DAV' 头是兼容性关键，它告诉客户端这是一个需要认证的 WebDAV 服务器。
+		if (!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)) {
+			response = new Response('Unauthorized', {
 				status: 401,
 				headers: {
 					'WWW-Authenticate': 'Basic realm="webdav"',
+					// 明确告诉客户端这是一个 DAV 服务器
+					'DAV': DAV_CLASS,
 				},
 			});
+		} else {
+			// 验证通过，正常处理请求
+			response = await dispatch_handler(request, bucket);
 		}
+		// --- 修改 2 结束 ---
 
-		let response: Response = await dispatch_handler(request, bucket);
 
-		// Set CORS headers
-		response.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
-		response.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '));
-		response.headers.set(
+		// 统一为所有响应设置 CORS 和其他通用头
+		// 注意：我们现在将 response 对象克隆一份来修改 headers，这是更安全的做法。
+		const finalResponse = new Response(response.body, response);
+
+		finalResponse.headers.set('Access-Control-Allow-Origin', request.headers.get('Origin') ?? '*');
+		finalResponse.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '));
+		finalResponse.headers.set(
 			'Access-Control-Allow-Headers',
 			['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range'].join(', '),
 		);
-		response.headers.set(
+		finalResponse.headers.set(
 			'Access-Control-Expose-Headers',
 			['content-type', 'content-length', 'dav', 'etag', 'last-modified', 'location', 'date', 'content-range'].join(
 				', ',
 			),
 		);
-		response.headers.set('Access-Control-Allow-Credentials', 'false');
-		response.headers.set('Access-Control-Max-Age', '86400');
+		finalResponse.headers.set('Access-Control-Allow-Credentials', 'false');
+		finalResponse.headers.set('Access-Control-Max-Age', '86400');
 
-		return response;
+		// 确保所有成功的响应也包含 DAV 头
+		if (finalResponse.status >= 200 && finalResponse.status < 300) {
+			finalResponse.headers.set('DAV', DAV_CLASS);
+		}
+
+		return finalResponse;
 	},
 };
+

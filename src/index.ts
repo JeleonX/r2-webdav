@@ -703,7 +703,7 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 	switch (request.method) {
 		case 'OPTIONS': {
 			return new Response(null, {
-				status: 204,
+				status: 200,
 				headers: {
 					Allow: SUPPORT_METHODS.join(', '),
 					DAV: DAV_CLASS,
@@ -762,7 +762,10 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
 
-		if (!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)) {
+		if (
+			request.method !== 'OPTIONS' &&
+			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
+		) {
 			return new Response('Unauthorized', {
 				status: 401,
 				headers: {

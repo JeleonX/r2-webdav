@@ -762,10 +762,7 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const { bucket } = env;
 
-		if (
-			request.method !== 'OPTIONS' &&
-			!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)
-		) {
+		if (!is_authorized(request.headers.get('Authorization') ?? '', env.USERNAME, env.PASSWORD)) {
 			return new Response('Unauthorized', {
 				status: 401,
 				headers: {

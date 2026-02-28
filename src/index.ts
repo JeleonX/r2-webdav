@@ -115,8 +115,8 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			const bIsDir = b.customMetadata?.resourcetype === '<collection />';
 			if (aIsDir && !bIsDir) return -1;
 			if (!aIsDir && bIsDir) return 1;
-			// 同类型按上传时间降序（新的在前）
-			return b.uploaded.getTime() - a.uploaded.getTime();
+			// 同类型按名称降序排列（如 202602281619 排在 202602281401 上面）
+			return b.key.localeCompare(a.key);
 		});
 
 		for (const object of objects) {

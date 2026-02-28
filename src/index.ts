@@ -105,8 +105,11 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			if (object.key === resource_path) {
 				continue;
 			}
-			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-			page += `<a href="${href}">${object.httpMetadata?.contentDisposition ?? object.key.slice(prefix.length)}</a><br>`;
+			// NOTE: href 使用 encodeURI 确保 URL 合法，显示文本使用 decodeURIComponent 解码中文
+			let rawPath = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+			let href = encodeURI(rawPath);
+			let displayName = object.httpMetadata?.contentDisposition ?? decodeURIComponent(object.key.slice(prefix.length));
+			page += `<a href="${href}">${displayName}</a><br>`;
 		}
 		// 定义模板
 		var pageSource = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>R2Storage</title><style>*{box-sizing:border-box;}body{padding:10px;font-family:'Segoe UI','Circular','Roboto','Lato','Helvetica Neue','Arial Rounded MT Bold','sans-serif';}a{display:inline-block;width:100%;color:#000;text-decoration:none;padding:5px 10px;cursor:pointer;border-radius:5px;}a:hover{background-color:#60C590;color:white;}a[href="../"]{background-color:#cbd5e1;}</style></head><body><h1>R2 Storage</h1><div>${page}</div></body></html>`;
@@ -307,7 +310,8 @@ function generate_propfind_response(object: R2Object | null): string {
 	</response>`;
 	}
 
-	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+	// NOTE: PROPFIND 响应中的 href 需要 URL 编码，确保中文路径正确传输
+	let href = encodeURI(`/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`);
 	return `
 	<response>
 		<href>${href}</href>
@@ -750,12 +754,12 @@ async function dispatch_handler(request: Request, bucket: R2Bucket): Promise<Res
 }
 
 function is_authorized(authorization_header: string, username: string, password: string): boolean {
-    const encoder = new TextEncoder();
+	const encoder = new TextEncoder();
 
-    const header = encoder.encode(authorization_header);
-    const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
+	const header = encoder.encode(authorization_header);
+	const expected = encoder.encode(`Basic ${btoa(`${username}:${password}`)}`);
 
-    return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
+	return header.byteLength === expected.byteLength && crypto.subtle.timingSafeEqual(header, expected);
 }
 
 export default {

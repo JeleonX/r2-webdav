@@ -101,13 +101,27 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			prefix = `${resource_path}/`;
 		}
 
+		// NOTE: 先收集所有对象，按上传时间降序排列（最新上传的排最前），文件夹优先
+		let objects: R2Object[] = [];
 		for await (const object of listAll(bucket, prefix)) {
 			if (object.key === resource_path) {
 				continue;
 			}
-			// NOTE: href 使用 encodeURI 确保 URL 合法，显示文本使用 decodeURIComponent 解码中文
-			let rawPath = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-			let href = encodeURI(rawPath);
+			objects.push(object);
+		}
+		objects.sort((a, b) => {
+			// 文件夹排在文件之前
+			const aIsDir = a.customMetadata?.resourcetype === '<collection />';
+			const bIsDir = b.customMetadata?.resourcetype === '<collection />';
+			if (aIsDir && !bIsDir) return -1;
+			if (!aIsDir && bIsDir) return 1;
+			// 同类型按上传时间降序（新的在前）
+			return b.uploaded.getTime() - a.uploaded.getTime();
+		});
+
+		for (const object of objects) {
+			// NOTE: R2 key 已经是 percent-encoded，直接用作 href；显示文本用 decodeURIComponent 解码中文
+			let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 			let displayName = object.httpMetadata?.contentDisposition ?? decodeURIComponent(object.key.slice(prefix.length));
 			page += `<a href="${href}">${displayName}</a><br>`;
 		}
@@ -310,8 +324,8 @@ function generate_propfind_response(object: R2Object | null): string {
 	</response>`;
 	}
 
-	// NOTE: PROPFIND 响应中的 href 需要 URL 编码，确保中文路径正确传输
-	let href = encodeURI(`/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`);
+	// NOTE: R2 key 已经是 percent-encoded，直接用作 href，不能再 encodeURI 否则会双重编码
+	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 	return `
 	<response>
 		<href>${href}</href>

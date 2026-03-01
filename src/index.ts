@@ -307,6 +307,29 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	return new Response('', { status: 201 });
 }
 
+/**
+ * 转义 XML 特殊字符，防止属性值破坏 XML 结构
+ */
+function escapeXml(str: string): string {
+	return str
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;')
+		.replace(/'/g, '&apos;');
+}
+
+/**
+ * 格式化 DAV 属性为 XML 元素
+ * NOTE: resourcetype 的值本身是 XML 片段（如 <collection />），不做转义
+ */
+function formatDavProp(key: string, value: string): string {
+	if (key === 'resourcetype') {
+		return `<${key}>${value}</${key}>`;
+	}
+	return `<${key}>${escapeXml(value)}</${key}>`;
+}
+
 function generate_propfind_response(object: R2Object | null): string {
 	if (object === null) {
 		return `
@@ -316,8 +339,8 @@ function generate_propfind_response(object: R2Object | null): string {
 			<prop>
 			${Object.entries(fromR2Object(null))
 				.filter(([_, value]) => value !== undefined)
-				.map(([key, value]) => `<${key}>${value}</${key}>`)
-				.join('\n				')}
+				.map(([key, value]) => formatDavProp(key, value!))
+				.join('\n\t\t\t\t')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>
@@ -328,13 +351,13 @@ function generate_propfind_response(object: R2Object | null): string {
 	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 	return `
 	<response>
-		<href>${href}</href>
+		<href>${escapeXml(href)}</href>
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
 			.filter(([_, value]) => value !== undefined)
-			.map(([key, value]) => `<${key}>${value}</${key}>`)
-			.join('\n				')}
+			.map(([key, value]) => formatDavProp(key, value!))
+			.join('\n\t\t\t\t')}
 			</prop>
 			<status>HTTP/1.1 200 OK</status>
 		</propstat>

@@ -78,6 +78,9 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 function make_resource_path(request: Request): string {
 	let path = new URL(request.url).pathname.slice(1);
 	path = path.endsWith('/') ? path.slice(0, -1) : path;
+	// NOTE: PROPFIND 中 & 被 percent-encode 为 %26，客户端请求也会携带 %26
+	// 需要还原为原始 & 以匹配 R2 key
+	path = path.replace(/%26/gi, '&');
 	return path;
 }
 
@@ -347,8 +350,10 @@ function generate_propfind_response(object: R2Object | null): string {
 	</response>`;
 	}
 
-	// NOTE: R2 key 已经是 percent-encoded，直接用作 href，不能再 encodeURI 否则会双重编码
+	// NOTE: & 在 URL path 中合法但在 XML 中非法，使用 percent-encode 而非 XML 实体编码
+	// 因为 WinSCP 等客户端不会对 href 做 XML 实体解码，但会保留 percent-encode
 	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
+	href = href.replace(/&/g, '%26');
 	return `
 	<response>
 		<href>${href}</href>
@@ -414,7 +419,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 	return new Response(page, {
 		status: 207,
 		headers: {
-			'Content-Type': 'text/xml',
+			'Content-Type': 'application/xml; charset="utf-8"',
 		},
 	});
 }

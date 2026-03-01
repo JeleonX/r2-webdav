@@ -75,9 +75,13 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 	};
 }
 
-function make_resource_path(request: Request): string {
+function get_raw_path(request: Request): string {
 	let path = new URL(request.url).pathname.slice(1);
-	path = path.endsWith('/') ? path.slice(0, -1) : path;
+	return path.endsWith('/') ? path.slice(0, -1) : path;
+}
+
+function make_resource_path(request: Request): string {
+	let path = get_raw_path(request);
 	// NOTE: 统一解码为 Unicode，确保不同客户端编码差异不影响 R2 key 匹配
 	try {
 		path = decodeURIComponent(path);
@@ -88,10 +92,9 @@ function make_resource_path(request: Request): string {
 }
 
 /**
- * 兼容旧版 percent-encoded R2 key：先尝试解码后的 key，找不到再尝试原始编码的 key
+ * 兼容旧版 percent-encoded R2 key：先尝试解码后的 key，找不到再尝试原始编码的 key，最后尝试遍历目录进行模糊匹配。
  */
-async function resolve_resource_path(request: Request, bucket: R2Bucket): Promise<{ path: string; object: R2Object | null }> {
-	let rawPath = new URL(request.url).pathname.slice(1);
+async function resolve_resource_path(rawPath: string, bucket: R2Bucket): Promise<{ path: string; object: R2Object | null }> {
 	rawPath = rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
 	let decodedPath = rawPath;
 	try {
@@ -102,10 +105,28 @@ async function resolve_resource_path(request: Request, bucket: R2Bucket): Promis
 	let object = await bucket.head(decodedPath);
 	if (object) return { path: decodedPath, object };
 
-	// 再尝试原始编码的 key（旧格式），仅当解码后与原始不同时
 	if (decodedPath !== rawPath) {
+		// 再尝试原始编码的 key（旧格式），仅当解码后与原始不同时
 		object = await bucket.head(rawPath);
 		if (object) return { path: rawPath, object };
+
+		// 终极回退：处理不同大小写的 percent-encoding（如 %e9 vs %E9）导致的无法命中
+		// 取 rawPath 中最靠前的不容易变化的合法部分作为 prefix，缩小搜索范围
+		let safePrefix = rawPath.split('%')[0];
+		let cursor: string | undefined = undefined;
+		do {
+			const listed = await bucket.list({ prefix: safePrefix, cursor });
+			for (const obj of listed.objects) {
+				try {
+					// 只要存的 key 解码后和 HTTP 请求路径解码后一致，就是同一个文件
+					if (decodeURIComponent(obj.key) === decodedPath) {
+						return { path: obj.key, object: obj };
+					}
+				} catch (e) { }
+			}
+			if (listed.truncated) cursor = listed.cursor;
+			else break;
+		} while (true);
 	}
 
 	return { path: decodedPath, object: null };
@@ -164,14 +185,19 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 		});
 	} else {
 		// NOTE: 使用 resolve_resource_path 兼容新旧 R2 key 格式
-		let { path: resolvedPath } = await resolve_resource_path(request, bucket);
-		let object = await bucket.get(resolvedPath, {
-			onlyIf: request.headers,
-			range: request.headers,
-		});
+		let rawPath = get_raw_path(request);
+		let { path: resolvedPath, object: resolvedObj } = await resolve_resource_path(rawPath, bucket);
+		// resolve_resource_path 用的 head，为了获取 body 需要使用 get
+		let object = null;
+		if (resolvedObj) {
+			object = await bucket.get(resolvedPath, {
+				onlyIf: request.headers,
+				range: request.headers,
+			});
+		}
 
 		let isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => {
-			return 'body' in object;
+			return object !== null && 'body' in object;
 		};
 
 		if (object === null) {
@@ -241,12 +267,13 @@ async function handle_put(request: Request, bucket: R2Bucket): Promise<Response>
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
+	let rawPath = get_raw_path(request);
 	let resource_path = make_resource_path(request);
 
 	// Check if the parent directory exists
-	let dirpath = resource_path.split('/').slice(0, -1).join('/');
-	if (dirpath !== '') {
-		let dir = await bucket.head(dirpath);
+	let rawDirpath = rawPath.split('/').slice(0, -1).join('/');
+	if (rawDirpath !== '') {
+		let { object: dir } = await resolve_resource_path(rawDirpath, bucket);
 		if (!(dir && dir.customMetadata?.resourcetype === '<collection />')) {
 			return new Response('Conflict', { status: 409 });
 		}
@@ -282,7 +309,8 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 	}
 
 	// NOTE: 使用 resolve_resource_path 兼容新旧两种 R2 key 格式
-	let { path: resolvedPath, object: resource } = await resolve_resource_path(request, bucket);
+	let rawPath = get_raw_path(request);
+	let { path: resolvedPath, object: resource } = await resolve_resource_path(rawPath, bucket);
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
@@ -318,19 +346,23 @@ async function handle_mkcol(request: Request, bucket: R2Bucket): Promise<Respons
 	// 	return new Response('Unsupported Media Type', { status: 415 });
 	// }
 
+	let rawPath = get_raw_path(request);
 	let resource_path = make_resource_path(request);
 
 	// Check if the resource already exists
-	let resource = await bucket.head(resource_path);
+	let { object: resource } = await resolve_resource_path(rawPath, bucket);
 	if (resource !== null) {
 		return new Response('Method Not Allowed', { status: 405 });
 	}
 
 	// Check if the parent directory exists
-	let parent_dir = resource_path.split('/').slice(0, -1).join('/');
+	let rawDirpath = rawPath.split('/').slice(0, -1).join('/');
 
-	if (parent_dir !== '' && !(await bucket.head(parent_dir))) {
-		return new Response('Conflict', { status: 409 });
+	if (rawDirpath !== '') {
+		let { object: dir } = await resolve_resource_path(rawDirpath, bucket);
+		if (!dir) {
+			return new Response('Conflict', { status: 409 });
+		}
 	}
 
 	await bucket.put(resource_path, new Uint8Array(), {
@@ -407,22 +439,22 @@ function generate_propfind_response(object: R2Object | null): string {
 }
 
 async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let rawPath = get_raw_path(request);
+	let { path: resolvedPath, object: resource } = await resolve_resource_path(rawPath, bucket);
 
 	let is_collection: boolean;
 	let page = `<?xml version="1.0" encoding="utf-8"?>
 <multistatus xmlns="DAV:">`;
 
-	if (resource_path === '') {
+	if (rawPath === '') {
 		page += generate_propfind_response(null);
 		is_collection = true;
 	} else {
-		let object = await bucket.head(resource_path);
-		if (object === null) {
+		if (resource === null) {
 			return new Response('Not Found', { status: 404 });
 		}
-		is_collection = object.customMetadata?.resourcetype === '<collection />';
-		page += generate_propfind_response(object);
+		is_collection = resource.customMetadata?.resourcetype === '<collection />';
+		page += generate_propfind_response(resource);
 	}
 
 	if (is_collection) {
@@ -432,7 +464,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				break;
 			case '1':
 				{
-					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					let prefix = resolvedPath === '' ? resolvedPath : resolvedPath + '/';
 					for await (let object of listAll(bucket, prefix)) {
 						page += generate_propfind_response(object);
 					}
@@ -440,7 +472,7 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 				break;
 			case 'infinity':
 				{
-					let prefix = resource_path === '' ? resource_path : resource_path + '/';
+					let prefix = resolvedPath === '' ? resolvedPath : resolvedPath + '/';
 					for await (let object of listAll(bucket, prefix, true)) {
 						page += generate_propfind_response(object);
 					}
@@ -462,10 +494,10 @@ async function handle_propfind(request: Request, bucket: R2Bucket): Promise<Resp
 }
 
 async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Response> {
-	const resource_path = make_resource_path(request);
+	let rawPath = get_raw_path(request);
 
 	// 检查资源是否存在
-	let object = await bucket.head(resource_path);
+	let { object, path: resolvedPath } = await resolve_resource_path(rawPath, bucket);
 	if (object === null) {
 		return new Response('Not Found', { status: 404 });
 	}
@@ -529,12 +561,12 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	}
 
 	// 更新对象的元数据
-	const src = await bucket.get(object.key);
+	const src = await bucket.get(resolvedPath);
 	if (src === null) {
 		return new Response('Not Found', { status: 404 });
 	}
 
-	await bucket.put(object.key, src.body, {
+	await bucket.put(resolvedPath, src.body, {
 		httpMetadata: object.httpMetadata,
 		customMetadata: customMetadata,
 	});
@@ -545,7 +577,7 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	for (const propName in setProperties) {
 		responseXML += `
     <response>
-        <href>/${object.key}</href>
+        <href>/${resolvedPath}</href>
         <propstat>
             <prop>
                 <${propName} />
@@ -558,7 +590,7 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 	for (const propName of removeProperties) {
 		responseXML += `
     <response>
-        <href>/${object.key}</href>
+        <href>/${resolvedPath}</href>
         <propstat>
             <prop>
                 <${propName} />
@@ -579,31 +611,40 @@ async function handle_proppatch(request: Request, bucket: R2Bucket): Promise<Res
 }
 
 async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let rawPath = get_raw_path(request);
 	let dont_overwrite = request.headers.get('Overwrite') === 'F';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = new URL(destination_header).pathname.slice(1);
-	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let rawDestination = new URL(destination_header).pathname.slice(1);
+	rawDestination = rawDestination.endsWith('/') ? rawDestination.slice(0, -1) : rawDestination;
+	let destination = '';
+	try {
+		destination = decodeURIComponent(rawDestination);
+	} catch (e) {
+		destination = rawDestination;
+	}
 
 	// Check if the parent directory exists
-	let destination_parent = destination
+	let rawDestinationParent = rawDestination
 		.split('/')
-		.slice(0, destination.endsWith('/') ? -2 : -1)
+		.slice(0, rawDestination.endsWith('/') ? -2 : -1)
 		.join('/');
-	if (destination_parent !== '' && !(await bucket.head(destination_parent))) {
-		return new Response('Conflict', { status: 409 });
+	if (rawDestinationParent !== '') {
+		let { object: dir } = await resolve_resource_path(rawDestinationParent, bucket);
+		if (!dir) {
+			return new Response('Conflict', { status: 409 });
+		}
 	}
 
 	// Check if the destination already exists
-	let destination_exists = await bucket.head(destination);
+	let { object: destination_exists } = await resolve_resource_path(rawDestination, bucket);
 	if (dont_overwrite && destination_exists) {
 		return new Response('Precondition Failed', { status: 412 });
 	}
 
-	let resource = await bucket.head(resource_path);
+	let { object: resource, path: resolvedPath } = await resolve_resource_path(rawPath, bucket);
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
@@ -614,7 +655,7 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
 			case 'infinity': {
-				let prefix = resource_path + '/';
+				let prefix = resolvedPath + '/';
 				const copy = async (object: R2Object) => {
 					let target = destination + '/' + object.key.slice(prefix.length);
 					target = target.endsWith('/') ? target.slice(0, -1) : target;
@@ -674,35 +715,44 @@ async function handle_copy(request: Request, bucket: R2Bucket): Promise<Response
 }
 
 async function handle_move(request: Request, bucket: R2Bucket): Promise<Response> {
-	let resource_path = make_resource_path(request);
+	let rawPath = get_raw_path(request);
 	let overwrite = request.headers.get('Overwrite') === 'T';
 	let destination_header = request.headers.get('Destination');
 	if (destination_header === null) {
 		return new Response('Bad Request', { status: 400 });
 	}
-	let destination = new URL(destination_header).pathname.slice(1);
-	destination = destination.endsWith('/') ? destination.slice(0, -1) : destination;
+	let rawDestination = new URL(destination_header).pathname.slice(1);
+	rawDestination = rawDestination.endsWith('/') ? rawDestination.slice(0, -1) : rawDestination;
+	let destination = '';
+	try {
+		destination = decodeURIComponent(rawDestination);
+	} catch (e) {
+		destination = rawDestination;
+	}
 
 	// Check if the parent directory exists
-	let destination_parent = destination
+	let rawDestinationParent = rawDestination
 		.split('/')
-		.slice(0, destination.endsWith('/') ? -2 : -1)
+		.slice(0, rawDestination.endsWith('/') ? -2 : -1)
 		.join('/');
-	if (destination_parent !== '' && !(await bucket.head(destination_parent))) {
-		return new Response('Conflict', { status: 409 });
+	if (rawDestinationParent !== '') {
+		let { object: dir } = await resolve_resource_path(rawDestinationParent, bucket);
+		if (!dir) {
+			return new Response('Conflict', { status: 409 });
+		}
 	}
 
 	// Check if the destination already exists
-	let destination_exists = await bucket.head(destination);
+	let { object: destination_exists } = await resolve_resource_path(rawDestination, bucket);
 	if (!overwrite && destination_exists) {
 		return new Response('Precondition Failed', { status: 412 });
 	}
 
-	let resource = await bucket.head(resource_path);
+	let { object: resource, path: resolvedPath } = await resolve_resource_path(rawPath, bucket);
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
-	if (resource.key === destination) {
+	if (resolvedPath === destination) {
 		return new Response('Bad Request', { status: 400 });
 	}
 
@@ -717,7 +767,7 @@ async function handle_move(request: Request, bucket: R2Bucket): Promise<Response
 		let depth = request.headers.get('Depth') ?? 'infinity';
 		switch (depth) {
 			case 'infinity': {
-				let prefix = resource_path + '/';
+				let prefix = resolvedPath + '/';
 				const move = async (object: R2Object) => {
 					let target = destination + '/' + object.key.slice(prefix.length);
 					target = target.endsWith('/') ? target.slice(0, -1) : target;

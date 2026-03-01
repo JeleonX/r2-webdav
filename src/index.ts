@@ -78,10 +78,37 @@ function fromR2Object(object: R2Object | null | undefined): DavProperties {
 function make_resource_path(request: Request): string {
 	let path = new URL(request.url).pathname.slice(1);
 	path = path.endsWith('/') ? path.slice(0, -1) : path;
-	// NOTE: PROPFIND 中 & 被 percent-encode 为 %26，客户端请求也会携带 %26
-	// 需要还原为原始 & 以匹配 R2 key
-	path = path.replace(/%26/gi, '&');
+	// NOTE: 统一解码为 Unicode，确保不同客户端编码差异不影响 R2 key 匹配
+	try {
+		path = decodeURIComponent(path);
+	} catch (e) {
+		// 解码失败（如格式错误的 percent-encoding），使用原始路径
+	}
 	return path;
+}
+
+/**
+ * 兼容旧版 percent-encoded R2 key：先尝试解码后的 key，找不到再尝试原始编码的 key
+ */
+async function resolve_resource_path(request: Request, bucket: R2Bucket): Promise<{ path: string; object: R2Object | null }> {
+	let rawPath = new URL(request.url).pathname.slice(1);
+	rawPath = rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
+	let decodedPath = rawPath;
+	try {
+		decodedPath = decodeURIComponent(rawPath);
+	} catch (e) { }
+
+	// 先尝试解码后的 key（新格式）
+	let object = await bucket.head(decodedPath);
+	if (object) return { path: decodedPath, object };
+
+	// 再尝试原始编码的 key（旧格式），仅当解码后与原始不同时
+	if (decodedPath !== rawPath) {
+		object = await bucket.head(rawPath);
+		if (object) return { path: rawPath, object };
+	}
+
+	return { path: decodedPath, object: null };
 }
 
 async function handle_head(request: Request, bucket: R2Bucket): Promise<Response> {
@@ -136,7 +163,9 @@ async function handle_get(request: Request, bucket: R2Bucket): Promise<Response>
 			headers: { 'Content-Type': 'text/html; charset=utf-8' },
 		});
 	} else {
-		let object = await bucket.get(resource_path, {
+		// NOTE: 使用 resolve_resource_path 兼容新旧 R2 key 格式
+		let { path: resolvedPath } = await resolve_resource_path(request, bucket);
+		let object = await bucket.get(resolvedPath, {
 			onlyIf: request.headers,
 			range: request.headers,
 		});
@@ -252,11 +281,12 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 		return new Response(null, { status: 204 });
 	}
 
-	let resource = await bucket.head(resource_path);
+	// NOTE: 使用 resolve_resource_path 兼容新旧两种 R2 key 格式
+	let { path: resolvedPath, object: resource } = await resolve_resource_path(request, bucket);
 	if (resource === null) {
 		return new Response('Not Found', { status: 404 });
 	}
-	await bucket.delete(resource_path);
+	await bucket.delete(resolvedPath);
 	if (resource.customMetadata?.resourcetype !== '<collection />') {
 		return new Response(null, { status: 204 });
 	}
@@ -265,7 +295,7 @@ async function handle_delete(request: Request, bucket: R2Bucket): Promise<Respon
 		cursor: string | undefined = undefined;
 	do {
 		r2_objects = await bucket.list({
-			prefix: resource_path + '/',
+			prefix: resolvedPath + '/',
 			cursor: cursor,
 		});
 		let keys = r2_objects.objects.map((object) => object.key);
@@ -350,10 +380,17 @@ function generate_propfind_response(object: R2Object | null): string {
 	</response>`;
 	}
 
-	// NOTE: & 在 URL path 中合法但在 XML 中非法，使用 percent-encode 而非 XML 实体编码
-	// 因为 WinSCP 等客户端不会对 href 做 XML 实体解码，但会保留 percent-encode
-	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
-	href = href.replace(/&/g, '%26');
+	// NOTE: 解码 R2 key 为 Unicode 后再用 encodeURI 生成标准 URI
+	// 这样客户端发请求时 HTTP 层重新编码结果与 new URL().pathname 一致
+	let suffix = object.customMetadata?.resourcetype === '<collection />' ? '/' : '';
+	let decodedHref = '/';
+	try {
+		decodedHref += decodeURIComponent(object.key) + suffix;
+	} catch (e) {
+		decodedHref += object.key + suffix;
+	}
+	// encodeURI 保持 URI 合法性，& 单独处理避免 XML 解析错误
+	let href = encodeURI(decodedHref).replace(/&/g, '%26');
 	return `
 	<response>
 		<href>${href}</href>

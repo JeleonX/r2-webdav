@@ -351,7 +351,7 @@ function generate_propfind_response(object: R2Object | null): string {
 	let href = `/${object.key + (object.customMetadata?.resourcetype === '<collection />' ? '/' : '')}`;
 	return `
 	<response>
-		<href>${escapeXml(href)}</href>
+		<href>${href}</href>
 		<propstat>
 			<prop>
 			${Object.entries(fromR2Object(object))
